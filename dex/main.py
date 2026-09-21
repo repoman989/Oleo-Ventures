@@ -1,5 +1,7 @@
-"""Dex orchestrator entrypoint — V0 scaffold. Logs an objective and scopes it
-with a single sequential Ollama call. No Department/Staffing logic yet."""
+"""Dex orchestrator entrypoint — V0 scaffold. Logs an objective, scopes it, and
+audits the scope, each a single sequential Ollama call. No Department/Staffing
+logic yet. The audit step is the first seed of the Internal Audit role from
+docs/AGENT_ROLES.md, not the full thing."""
 
 import argparse
 import json
@@ -19,6 +21,14 @@ SCOPE_SYSTEM_PROMPT = (
     "Information/resources needed. Scoping only — do not delegate or assign work."
 )
 
+AUDIT_SYSTEM_PROMPT = (
+    "You are Dex's Internal Audit function at Oleo Ventures. You will be given "
+    "an ORIGINAL OBJECTIVE and a SCOPE RESPONSE derived from it. List only the "
+    "claims, resources, or details in the SCOPE RESPONSE that are NOT directly "
+    "stated or clearly implied by the OBJECTIVE — i.e. unsupported additions. "
+    "Be concise. If there are none, say exactly: 'No unsupported additions found.'"
+)
+
 
 def load_log():
     if LOG_FILE.exists():
@@ -26,11 +36,15 @@ def load_log():
     return []
 
 
-def append_log(entry):
+def save_log(log):
     STATE_DIR.mkdir(exist_ok=True)
+    LOG_FILE.write_text(json.dumps(log, indent=2))
+
+
+def append_log(entry):
     log = load_log()
     log.append(entry)
-    LOG_FILE.write_text(json.dumps(log, indent=2))
+    save_log(log)
 
 
 def default_model():
@@ -42,12 +56,12 @@ def default_model():
     return models[0]["name"]
 
 
-def scope_objective(objective, model):
+def ollama_generate(system, prompt, model):
     payload = json.dumps(
         {
             "model": model,
-            "system": SCOPE_SYSTEM_PROMPT,
-            "prompt": objective,
+            "system": system,
+            "prompt": prompt,
             "stream": False,
         }
     ).encode()
@@ -61,10 +75,48 @@ def scope_objective(objective, model):
     return result["response"].strip()
 
 
+def scope_objective(objective, model):
+    return ollama_generate(SCOPE_SYSTEM_PROMPT, objective, model)
+
+
+def audit_scope(objective, scope, model):
+    prompt = f"ORIGINAL OBJECTIVE:\n{objective}\n\nSCOPE RESPONSE:\n{scope}"
+    return ollama_generate(AUDIT_SYSTEM_PROMPT, prompt, model)
+
+
+def backfill_audit():
+    log = load_log()
+    model = default_model()
+    changed = False
+    for entry in log:
+        if "scope" not in entry or "audit_flags" in entry:
+            continue
+        entry_model = entry.get("model", model)
+        flags = audit_scope(entry["objective"], entry["scope"], entry_model)
+        entry["audit_flags"] = flags
+        changed = True
+        print(f"Backfilled audit_flags for: {entry['objective']}")
+        print(flags)
+        print()
+    if changed:
+        save_log(log)
+    else:
+        print("Nothing to backfill — every entry with a scope already has audit_flags.")
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Dex — accept an objective, scope it, log it, exit.")
+    parser = argparse.ArgumentParser(description="Dex — accept an objective, scope it, audit the scope, log it, exit.")
     parser.add_argument("objective", nargs="?", help="The objective to log. Reads from stdin if omitted.")
+    parser.add_argument(
+        "--backfill-audit",
+        action="store_true",
+        help="Backfill audit_flags on existing entries that have a scope but no audit_flags, without creating new entries.",
+    )
     args = parser.parse_args()
+
+    if args.backfill_audit:
+        backfill_audit()
+        return
 
     objective = args.objective or sys.stdin.read().strip()
     if not objective:
@@ -73,8 +125,9 @@ def main():
     try:
         model = default_model()
         scope = scope_objective(objective, model)
+        audit_flags = audit_scope(objective, scope, model)
     except Exception as exc:
-        print(f"Scope call failed: {exc}", file=sys.stderr)
+        print(f"Scope/audit call failed: {exc}", file=sys.stderr)
         sys.exit(1)
 
     entry = {
@@ -82,12 +135,16 @@ def main():
         "received_at": datetime.now(timezone.utc).isoformat(),
         "model": model,
         "scope": scope,
+        "audit_flags": audit_flags,
     }
     append_log(entry)
     print(f"Logged objective: {objective}")
     print()
     print(f"Scope (model: {model}):")
     print(scope)
+    print()
+    print(f"Audit flags (model: {model}):")
+    print(audit_flags)
 
 
 if __name__ == "__main__":
