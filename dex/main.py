@@ -14,6 +14,11 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 LOG_FILE = STATE_DIR / "objectives.json"
 OLLAMA_BASE = "http://127.0.0.1:11434"
 
+# Audit model is fixed, not dynamically resolved like the scoping model — Internal
+# Audit must be a distinct model from whatever produced the work it reviews. See
+# state/README.md for why this is a real independence requirement, not just cost.
+AUDIT_MODEL = "llama3.2:3b"
+
 SCOPE_SYSTEM_PROMPT = (
     "You are Dex, Chief of Staff at Oleo Ventures. Given an objective from the "
     "Founder, respond concisely (under 150 words) with four labeled sections: "
@@ -79,21 +84,20 @@ def scope_objective(objective, model):
     return ollama_generate(SCOPE_SYSTEM_PROMPT, objective, model)
 
 
-def audit_scope(objective, scope, model):
+def audit_scope(objective, scope):
     prompt = f"ORIGINAL OBJECTIVE:\n{objective}\n\nSCOPE RESPONSE:\n{scope}"
-    return ollama_generate(AUDIT_SYSTEM_PROMPT, prompt, model)
+    return ollama_generate(AUDIT_SYSTEM_PROMPT, prompt, AUDIT_MODEL)
 
 
 def backfill_audit():
     log = load_log()
-    model = default_model()
     changed = False
     for entry in log:
-        if "scope" not in entry or "audit_flags" in entry:
+        if "scope" not in entry:
             continue
-        entry_model = entry.get("model", model)
-        flags = audit_scope(entry["objective"], entry["scope"], entry_model)
+        flags = audit_scope(entry["objective"], entry["scope"])
         entry["audit_flags"] = flags
+        entry["audit_model"] = AUDIT_MODEL
         changed = True
         print(f"Backfilled audit_flags for: {entry['objective']}")
         print(flags)
@@ -101,7 +105,7 @@ def backfill_audit():
     if changed:
         save_log(log)
     else:
-        print("Nothing to backfill — every entry with a scope already has audit_flags.")
+        print("Nothing to backfill — no entries have a scope yet.")
 
 
 def main():
@@ -110,7 +114,7 @@ def main():
     parser.add_argument(
         "--backfill-audit",
         action="store_true",
-        help="Backfill audit_flags on existing entries that have a scope but no audit_flags, without creating new entries.",
+        help="Re-run audit_flags for every entry that has a scope, using the current audit model, overwriting any existing audit_flags.",
     )
     args = parser.parse_args()
 
@@ -125,7 +129,7 @@ def main():
     try:
         model = default_model()
         scope = scope_objective(objective, model)
-        audit_flags = audit_scope(objective, scope, model)
+        audit_flags = audit_scope(objective, scope)
     except Exception as exc:
         print(f"Scope/audit call failed: {exc}", file=sys.stderr)
         sys.exit(1)
@@ -136,6 +140,7 @@ def main():
         "model": model,
         "scope": scope,
         "audit_flags": audit_flags,
+        "audit_model": AUDIT_MODEL,
     }
     append_log(entry)
     print(f"Logged objective: {objective}")
@@ -143,7 +148,7 @@ def main():
     print(f"Scope (model: {model}):")
     print(scope)
     print()
-    print(f"Audit flags (model: {model}):")
+    print(f"Audit flags (model: {AUDIT_MODEL}):")
     print(audit_flags)
 
 
