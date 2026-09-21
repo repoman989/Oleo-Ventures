@@ -14,10 +14,14 @@ STATE_DIR = Path(__file__).resolve().parent.parent / "state"
 LOG_FILE = STATE_DIR / "objectives.json"
 OLLAMA_BASE = "http://127.0.0.1:11434"
 
-# Audit model is fixed, not dynamically resolved like the scoping model — Internal
-# Audit must be a distinct model from whatever produced the work it reviews. See
-# state/README.md for why this is a real independence requirement, not just cost.
-AUDIT_MODEL = "llama3.2:3b"
+# Both models are pinned explicitly, not dynamically resolved. An earlier version
+# picked the scope model as "whichever model /api/tags lists first" — but Ollama
+# orders that list by most-recently-pulled, so pulling a second or third model for
+# audit purposes silently changed which model did the scoping, twice, in practice.
+# With multiple models now pulled for different roles, there's no ordering left to
+# infer intent from — pinning both is the only reliable option.
+SCOPE_MODEL = "mistral:latest"
+AUDIT_MODEL = "llama3.1:8b"  # deliberately distinct from SCOPE_MODEL — see state/README.md
 
 SCOPE_SYSTEM_PROMPT = (
     "You are Dex, Chief of Staff at Oleo Ventures. Given an objective from the "
@@ -52,13 +56,12 @@ def append_log(entry):
     save_log(log)
 
 
-def default_model():
+def ensure_model_pulled(model):
     with urllib.request.urlopen(f"{OLLAMA_BASE}/api/tags", timeout=5) as resp:
         data = json.loads(resp.read().decode())
-    models = data.get("models", [])
-    if not models:
-        raise RuntimeError("no Ollama models pulled — run `ollama pull <model>` first")
-    return models[0]["name"]
+    names = {m["name"] for m in data.get("models", [])}
+    if model not in names:
+        raise RuntimeError(f"model '{model}' is not pulled — run `ollama pull {model}` first")
 
 
 def ollama_generate(system, prompt, model):
@@ -90,6 +93,7 @@ def audit_scope(objective, scope):
 
 
 def backfill_audit():
+    ensure_model_pulled(AUDIT_MODEL)
     log = load_log()
     changed = False
     for entry in log:
@@ -127,8 +131,9 @@ def main():
         parser.error("no objective provided (arg or stdin)")
 
     try:
-        model = default_model()
-        scope = scope_objective(objective, model)
+        ensure_model_pulled(SCOPE_MODEL)
+        ensure_model_pulled(AUDIT_MODEL)
+        scope = scope_objective(objective, SCOPE_MODEL)
         audit_flags = audit_scope(objective, scope)
     except Exception as exc:
         print(f"Scope/audit call failed: {exc}", file=sys.stderr)
@@ -137,7 +142,7 @@ def main():
     entry = {
         "objective": objective,
         "received_at": datetime.now(timezone.utc).isoformat(),
-        "model": model,
+        "model": SCOPE_MODEL,
         "scope": scope,
         "audit_flags": audit_flags,
         "audit_model": AUDIT_MODEL,
@@ -145,7 +150,7 @@ def main():
     append_log(entry)
     print(f"Logged objective: {objective}")
     print()
-    print(f"Scope (model: {model}):")
+    print(f"Scope (model: {SCOPE_MODEL}):")
     print(scope)
     print()
     print(f"Audit flags (model: {AUDIT_MODEL}):")
